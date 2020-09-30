@@ -23,7 +23,7 @@
   ((:file "package")
    (:file "encode" :depends-on ("package"))
    (:file "decode" :depends-on ("package")))
-  :in-order-to ((test-op (test-op "cl-base64/tests"))))
+  :in-order-to ((test-op (test-op "cl-base64/test"))))
 
 (defsystem cl-base64/test
     :depends-on (cl-base64 ptester kmrcl)
