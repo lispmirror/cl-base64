@@ -1,3 +1,10 @@
+cl-base64 (3.4.0-1) unstable; urgency=medium
+
+  * New upstream.
+    Performance and safety improvements (thanks to Janis Dzerins)
+
+ -- Kevin M. Rosenberg <kmr@debian.org>  Wed, 30 Sep 2020 18:06:36 +0000
+
 cl-base64 (3.3.4-1) unstable; urgency=medium
 
   * New upstream. (closes:796978) Thanks to Denis Martinez.

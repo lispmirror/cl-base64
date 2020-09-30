@@ -21,236 +21,240 @@
 
 (in-package #:cl-base64)
 
-(declaim (inline whitespace-p))
-(defun whitespace-p (c)
-  "Returns T for a whitespace character."
-  (or (char= c #\Newline) (char= c #\Linefeed)
-      (char= c #\Return) (char= c #\Space)
-      (char= c #\Tab)))
+(define-condition base64-error (error)
+  ((input
+    :initarg :input
+    :reader base64-error-input)
+   (position
+    :initarg :position
+    :reader base64-error-position
+    :type unsigned-byte)))
 
+(define-condition bad-base64-character (base64-error)
+  ((code :initarg :code :reader bad-base64-character-code))
+  (:report (lambda (condition stream)
+             (format stream "Bad character ~S at index ~D of ~S"
+                     (code-char (bad-base64-character-code condition))
+                     (base64-error-position condition)
+                     (base64-error-input condition)))))
 
-;;; Decoding
+(define-condition incomplete-base64-data (base64-error)
+  ()
+  (:report (lambda (condition stream)
+             (format stream "Unexpected end of Base64 data at index ~D of ~S"
+                     (base64-error-position condition)
+                     (base64-error-input condition)))))
 
-#+ignore
-(defmacro def-base64-stream-to-* (output-type)
-  `(defun ,(intern (concatenate 'string (symbol-name :base64-stream-to-)
-                                (symbol-name output-type)))
-    (input &key (uri nil)
-        ,@(when (eq output-type :stream)
-                '(stream)))
-     ,(concatenate 'string "Decode base64 stream to " (string-downcase
-                                                       (symbol-name output-type)))
-     (declare (stream input)
-              (optimize (speed 3) (space 0) (safety 0)))
-     (let ((pad (if uri *uri-pad-char* *pad-char*))
-           (decode-table (if uri *uri-decode-table* *decode-table*)))
-       (declare (type decode-table decode-table)
-                (type character pad))
-       (let (,@(case output-type
-                     (:string
-                      '((result (make-string (* 3 (truncate (length string) 4))))))
+(deftype array-index (&optional (length array-dimension-limit))
+  `(integer 0 (,length)))
+
+(deftype array-length (&optional (length array-dimension-limit))
+  `(integer 0 ,length))
+
+(deftype character-code ()
+  `(integer 0 (,char-code-limit)))
+
+(defmacro etypecase/unroll ((var &rest types) &body body)
+  #+sbcl `(etypecase ,var
+            ,@(loop for type in types
+                    collect `(,type ,@body)))
+  #-sbcl `(locally
+              (declare (type (or ,@types) ,var))
+            ,@body))
+
+(defmacro let/typed ((&rest vars) &body body)
+  `(let ,(loop for (var value) in vars
+               collect (list var value))
+     (declare ,@(loop for (var nil type) in vars
+                      when type
+                        collect (list 'type type var)))
+     ,@body))
+
+(defmacro define-base64-decoder (hose sink)
+  `(defun ,(intern (format nil "~A-~A-~A-~A" '#:base64 hose '#:to sink))
+       (input &key (table +decode-table+)
+                   (uri nil)
+                   ,@(when (eq sink :stream) `(stream))
+                   (whitespace :ignore))
+     ,(format nil "~
+Decode Base64 ~(~A~) to ~(~A~).
+
+TABLE is the decode table to use.  Two decode tables are provided:
++DECODE-TABLE+ (used by default) and +URI-DECODE-TABLE+.  See
+MAKE-DECODE-TABLE.
+
+For backwards-compatibility the URI parameter is supported.  If it is
+true, then +URI-DECODE-TABLE+ is used, and the value for TABLE
+parameter is ignored.
+
+WHITESPACE can be one of:
+
+  :ignore - Whitespace characters are ignored (default).
+  :signal - Signal a BAD-BASE64-CHARACTER condition using SIGNAL.
+  :error  - Signal a BAD-BASE64-CHARACTER condition using ERROR."
+              hose sink)
+     (declare (optimize (speed 3) (safety 1))
+              (type decode-table table)
+              (type ,(ecase hose
+                       (:stream 'stream)
+                       (:string 'string))
+                    input))
+     (let/typed ((decode-table (if uri +uri-decode-table+ table)
+                               decode-table)
+                 ,@(ecase sink
+                     (:stream)
                      (:usb8-array
-                      '((result (make-array (* 3 (truncate (length string) 4))
+                      (ecase hose
+                        (:stream
+                         `((result (make-array 1024
                                  :element-type '(unsigned-byte 8)
-                                 :fill-pointer nil
-                                 :adjustable nil)))))
-               (ridx 0))
-         (declare ,@(case output-type
+                                               :adjustable t
+                                               :fill-pointer 0)
+                                   (array (unsigned-byte 8) (*)))))
+                        (:string
+                         `((result (make-array (* 3 (ceiling (length input) 4))
+                                               :element-type '(unsigned-byte 8))
+                                   (simple-array (unsigned-byte 8) (*)))
+                           (rpos 0 array-index)))))
                           (:string
-                           '((simple-string result)))
-                          (:usb8-array
-                           '((type (simple-array (unsigned-byte 8) (*)) result))))
-                  (fixnum ridx))
-         (do* ((bitstore 0)
-               (bitcount 0)
-               (char (read-char stream nil #\null)
-                     (read-char stream nil #\null)))
-              ((eq char #\null)
-               ,(case output-type
+                      (case hose
                       (:stream
-                       'stream)
-                      ((:string :usb8-array)
-                       'result)
-                      ;; ((:stream :string)
-                      ;; '(subseq result 0 ridx))))
-                      ))
-           (declare (fixnum bitstore bitcount)
-                    (character char))
-           (let ((svalue (aref decode-table (the fixnum (char-code char)))))
-             (declare (fixnum svalue))
+                         `((result (make-array 1024
+                                               :element-type 'character
+                                               :adjustable t
+                                               :fill-pointer 0)
+                                   (array character (*)))))
+                        (:string
+                         `((result (make-array (* 3 (ceiling (length input) 4))
+                                               :element-type 'character)
+                                   (simple-array character (*)))
+                           (rpos 0 array-index)))))
+                     (:integer
+                      `((result 0 unsigned-byte)))))
+       (flet ((bad-char (pos code &optional (action :error))
+                (let ((args (list 'bad-base64-character
+                                  :input input
+                                  :position pos
+                                  :code code)))
+                  (ecase action
+                    (:error
+                     (apply #'error args))
+                    (:cerror
+                     (apply #'cerror "Ignore the error and continue." args))
+                    (:signal
+                     (apply #'signal args)))))
+              (incomplete-input (pos)
+                (error 'incomplete-base64-data :input input :position pos)))
+         ,(let ((body
+                  `(let/typed ((ipos 0 array-index)
+                               (bitstore 0 (unsigned-byte 24))
+                               (bitcount 0 (integer 0 14))
+                               (svalue -1 (signed-byte 8))
+                               (padchar 0 (integer 0 3))
+                               (code 0 fixnum))
+                     (loop
+                       ,@(ecase hose
+                           (:string
+                            `((if (< ipos length)
+                                  (setq code (char-code (aref input ipos)))
+                                  (return))))
+                           (:stream
+                            `((let ((char (read-char input nil nil)))
+                                (if char
+                                    (setq code (char-code char))
+                                    (return))))))
              (cond
-               ((>= svalue 0)
-                (setf bitstore (logior
-                                (the fixnum (ash bitstore 6))
+                           ((or (< 127 code)
+                                (= -1 (setq svalue (aref decode-table code))))
+                            (bad-char ipos code))
+                           ((= -2 svalue)
+                            (cond ((<= (incf padchar) 2)
+                                   (unless (<= 2 bitcount)
+                                     (bad-char ipos code))
+                                   (decf bitcount 2))
+                                  (t
+                                   (bad-char ipos code))))
+                           ((= -3 svalue)
+                            (ecase whitespace
+                              (:ignore
+                               ;; Do nothing.
+                               )
+                              (:error
+                               (bad-char ipos code :error))
+                              (:signal
+                               (bad-char ipos code :signal))))
+                           ((not (zerop padchar))
+                            (bad-char ipos code))
+                           (t
+                            (setf bitstore (logior (the (unsigned-byte 24)
+                                                        (ash bitstore 6))
                                 svalue))
                 (incf bitcount 6)
                 (when (>= bitcount 8)
                   (decf bitcount 8)
-                  (let ((ovalue (the fixnum
-                                  (logand
-                                   (the fixnum
-                                     (ash bitstore
-                                          (the fixnum (- bitcount))))
-                                   #xFF))))
-                    (declare (fixnum ovalue))
-                    ,(case output-type
-                           (:string
-                            '(setf (char result ridx) (code-char ovalue)))
+                              (let ((byte (logand (the (unsigned-byte 24)
+                                                       (ash bitstore (- bitcount)))
+                                                  #xFF)))
+                                (declare (type (unsigned-byte 8) byte))
+                                ,@(ecase sink
                            (:usb8-array
-                            '(setf (aref result ridx) ovalue))
+                                     (ecase hose
+                                       (:string
+                                        `((setf (aref result rpos) byte)
+                                          (incf rpos)))
                            (:stream
-                            '(write-char (code-char ovalue) stream)))
-                    (incf ridx)
-                    (setf bitstore (the fixnum (logand bitstore #xFF))))))
-               ((char= char pad)
-                ;; Could add checks to make sure padding is correct
-                ;; Currently, padding is ignored
-                )
-               ((whitespace-p char)
-                ;; Ignore whitespace
-                )
-               ((minusp svalue)
-                (warn "Bad character ~W in base64 decode" char))
-               )))))))
-
-;;(def-base64-stream-to-* :string)
-;;(def-base64-stream-to-* :stream)
-;;(def-base64-stream-to-* :usb8-array)
-
-(defmacro def-base64-string-to-* (output-type)
-  `(defun ,(intern (concatenate 'string (symbol-name :base64-string-to-)
-                                (symbol-name output-type)))
-    (input &key (uri nil)
-        ,@(when (eq output-type :stream)
-                '(stream)))
-     ,(concatenate 'string "Decode base64 string to " (string-downcase
-                                                       (symbol-name output-type)))
-     (declare (string input)
-              (optimize (speed 3) (safety 0) (space 0)))
-     (let ((pad (if uri *uri-pad-char* *pad-char*))
-           (decode-table (if uri *uri-decode-table* *decode-table*)))
-       (declare (type decode-table decode-table)
-                (type character pad))
-       (let (,@(case output-type
+                                        `((vector-push-extend byte result)))))
                      (:string
-                      '((result (make-string (* 3 (truncate (length input) 4))))))
-                     (:usb8-array
-                      '((result (make-array (* 3 (truncate (length input) 4))
-                                 :element-type '(unsigned-byte 8)
-                                 :fill-pointer nil
-                                 :adjustable nil)))))
-               (ridx 0))
-         (declare ,@(case output-type
+                                     (ecase hose
                           (:string
-                           '((simple-string result)))
-                          (:usb8-array
-                           '((type (simple-array (unsigned-byte 8) (*)) result))))
-                  (fixnum ridx))
-         (loop
-            for char of-type character across input
-            for svalue of-type fixnum = (aref decode-table
-                                              (the fixnum (char-code char)))
-            with bitstore of-type fixnum = 0
-            with bitcount of-type fixnum = 0
-            do
-              (cond
-                ((>= svalue 0)
-                 (setf bitstore (logior
-                                 (the fixnum (ash bitstore 6))
-                                 svalue))
-                 (incf bitcount 6)
-                 (when (>= bitcount 8)
-                   (decf bitcount 8)
-                   (let ((ovalue (the fixnum
-                                   (logand
-                                    (the fixnum
-                                      (ash bitstore
-                                           (the fixnum (- bitcount))))
-                                    #xFF))))
-                     (declare (fixnum ovalue))
-                     ,(case output-type
+                                        `((setf (schar result rpos)
+                                                (code-char byte))
+                                          (incf rpos)))
+                                       (:stream
+                                        `((vector-push-extend (code-char byte)
+                                                              result)))))
+                                    (:integer
+                                     `((setq result
+                                             (logior (ash result 8) byte))))
+                                    (:stream
+                                     '((write-char (code-char byte) stream)))))
+                              (setf bitstore (logand bitstore #xFF)))))
+                         (incf ipos))
+                     (unless (zerop bitcount)
+                       (incomplete-input ipos))
+                     ,(ecase sink
+                        ((:string :usb8-array)
+                         (ecase hose
                             (:string
-                             '(setf (char result ridx) (code-char ovalue)))
-                            (:usb8-array
-                             '(setf (aref result ridx) ovalue))
+                            `(if (= rpos (length result))
+                                 result
+                                 (subseq result 0 rpos)))
                             (:stream
-                             '(write-char (code-char ovalue) stream)))
-                     (incf ridx)
-                     (setf bitstore (the fixnum (logand bitstore #xFF))))))
-                 ((char= char pad)
-                  ;; Could add checks to make sure padding is correct
-                  ;; Currently, padding is ignored
-                  )
-                 ((whitespace-p char)
-                  ;; Ignore whitespace
-                  )
-                 ((minusp svalue)
-                  (warn "Bad character ~W in base64 decode" char))
-                 ))
-         ,(case output-type
-                (:stream
-                 'stream)
-                ((:usb8-array :string)
-                 '(subseq result 0 ridx)))))))
+                            `(copy-seq result))))
+                        (:integer
+                         'result)
+                        (:stream
+                         'stream)))))
+            (ecase hose
+              (:string
+               `(let ((length (length input)))
+                  (declare (type array-length length))
+                  (etypecase/unroll (input simple-base-string
+                                           simple-string
+                                           string)
+                    ,body)))
+              (:stream
+               body)))))))
 
-(def-base64-string-to-* :string)
-(def-base64-string-to-* :stream)
-(def-base64-string-to-* :usb8-array)
+(define-base64-decoder :string :usb8-array)
+(define-base64-decoder :string :string)
+(define-base64-decoder :string :integer)
+(define-base64-decoder :string :stream)
+
+(define-base64-decoder :stream :usb8-array)
+(define-base64-decoder :stream :string)
+(define-base64-decoder :stream :integer)
+(define-base64-decoder :stream :stream)
 
 ;; input-mode can be :string or :stream
 ;; input-format can be :character or :usb8
-
-(defun base64-string-to-integer (string &key (uri nil))
-  "Decodes a base64 string to an integer"
-  (declare (string string)
-           (optimize (speed 3) (safety 0) (space 0)))
-  (let ((pad (if uri *uri-pad-char* *pad-char*))
-        (decode-table (if uri *uri-decode-table* *decode-table*)))
-    (declare (type decode-table decode-table)
-             (character pad))
-    (let ((value 0))
-      (declare (integer value))
-      (loop
-         for char of-type character across string
-         for svalue of-type fixnum =
-           (aref decode-table (the fixnum (char-code char)))
-         do
-           (cond
-             ((>= svalue 0)
-              (setq value (+ svalue (ash value 6))))
-             ((char= char pad)
-              (setq value (ash value -2)))
-             ((whitespace-p char)
-              ; ignore whitespace
-              )
-             ((minusp svalue)
-              (warn "Bad character ~W in base64 decode" char))))
-      value)))
-
-
-(defun base64-stream-to-integer (stream &key (uri nil))
-  "Decodes a base64 string to an integer"
-  (declare (stream stream)
-           (optimize (speed 3) (space 0) (safety 0)))
-  (let ((pad (if uri *uri-pad-char* *pad-char*))
-        (decode-table (if uri *uri-decode-table* *decode-table*)))
-    (declare (type decode-table decode-table)
-             (character pad))
-    (do* ((value 0)
-          (char (read-char stream nil #\null)
-                (read-char stream nil #\null)))
-         ((eq char #\null)
-          value)
-      (declare (integer value)
-               (character char))
-      (let ((svalue (aref decode-table (the fixnum (char-code char)))))
-           (declare (fixnum svalue))
-           (cond
-             ((>= svalue 0)
-              (setq value (+ svalue (ash value 6))))
-             ((char= char pad)
-              (setq value (ash value -2)))
-             ((whitespace-p char)               ; ignore whitespace
-              )
-             ((minusp svalue)
-              (warn "Bad character ~W in base64 decode" char)))))))
